@@ -1,5 +1,6 @@
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import { derivePending, isRemediedStatus } from '@/data/status'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
@@ -43,16 +44,26 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
-  const lastStatus = meta.statuses[meta.statuses.length - 1]
+  const isNegative = NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb))
+  const previous = rows[index]
+  // 状态是唯一事实源：待处理统一由最新状态推导，检测页、修复页、看板用同一口径。
+  // 异常标记只在「问题已被实质修复/通过」时摘帽，其余正向动作（如生成报告）保留原结论；
+  // 往回走动作则强制置异常。
+  const abnormal = isNegative || (previous.abnormal && !isRemediedStatus(target))
   const updated: EntryRow = {
-    ...rows[index],
+    ...previous,
     status: target,
-    pending: target !== lastStatus,
-    abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
+    pending: derivePending(target),
+    abnormal,
   }
   const next = [...rows]
   next[index] = updated
-  saveRows(key, next)
+  try {
+    saveRows(key, next)
+  } catch {
+    // 落盘失败时 saveRows 不会改动内存，这里原样把失败带出去，不留半边更新。
+    return { ok: false, message: `${meta.entity}状态保存失败，本次「${action}」未生效` }
+  }
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
