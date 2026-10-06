@@ -13,6 +13,27 @@ export function moduleMeta(key: string): ModuleMeta {
   return meta
 }
 
+// 统一的状态读取口径：检测页、修复页、概览、导出都经过这里，同一条记录在任何地方结论一致。
+// 只补缺失字段，不改写已有值——已有漏点、已修复、复检中的记录保持原结果；空值或旧数据按模块默认值兼容。
+// 纯函数：不碰存储，重复读取不会改变状态。
+export function normalizeRow(row: EntryRow, meta: ModuleMeta): EntryRow {
+  const status =
+    typeof row.status === 'string' && row.status.trim() !== '' ? row.status : meta.statuses[0]
+  const pending =
+    typeof row.pending === 'boolean'
+      ? row.pending
+      : status !== meta.statuses[meta.statuses.length - 1]
+  const abnormal = typeof row.abnormal === 'boolean' ? row.abnormal : false
+  if (status === row.status && pending === row.pending && abnormal === row.abnormal) {
+    return row
+  }
+  return { ...row, status, pending, abnormal }
+}
+
+function normalizeRows(rows: EntryRow[], meta: ModuleMeta): EntryRow[] {
+  return rows.map((row) => normalizeRow(row, meta))
+}
+
 export function filterRows(rows: EntryRow[], filters: Record<string, string>): EntryRow[] {
   const pairs = Object.entries(filters).filter(([, value]) => value.trim() !== '')
   if (pairs.length === 0) {
@@ -24,7 +45,7 @@ export function filterRows(rows: EntryRow[], filters: Record<string, string>): E
 }
 
 export function listEntries(key: string, filters: Record<string, string> = {}): PageResult {
-  const matched = filterRows(listRows(key), filters)
+  const matched = filterRows(normalizeRows(listRows(key), moduleMeta(key)), filters)
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
@@ -34,7 +55,7 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
   }
-  const rows = listRows(key)
+  const rows = normalizeRows(listRows(key), meta)
   const index = rows.findIndex((row) => Number(row.id) === id)
   if (index < 0) {
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
@@ -52,7 +73,12 @@ export function runAction(key: string, id: number, action: string): ActionResult
   }
   const next = [...rows]
   next[index] = updated
-  saveRows(key, next)
+  try {
+    saveRows(key, next)
+  } catch (error) {
+    // 落盘失败时内存缓存也没动，状态保持一致，如实告诉操作人。
+    return { ok: false, message: error instanceof Error ? error.message : '本地存储写入失败，本次修改未保存' }
+  }
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
@@ -65,7 +91,8 @@ export function exportEntries(key: string): { filename: string; content: string 
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
-  for (const row of listRows(key)) {
+  // 导出与页面用同一份读取口径；格式、列序、文件名保持不变。
+  for (const row of normalizeRows(listRows(key), meta)) {
     lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
   }
   return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
@@ -87,7 +114,7 @@ export function downloadEntries(key: string): void {
 export function loadOverview(): OverviewResult {
   const rows = allRows()
   const modules = [...MODULE_BY_KEY.values()].map((meta) => {
-    const entries = rows[meta.key] ?? []
+    const entries = normalizeRows(rows[meta.key] ?? [], meta)
     return {
       name: meta.name,
       created: entries.length,
